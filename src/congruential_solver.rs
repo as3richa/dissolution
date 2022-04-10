@@ -1,33 +1,25 @@
-use core::arch::x86_64::{
-    _mm256_cmpeq_epi32, _mm256_cvtepi32_ps, _mm256_load_si256, _mm256_movemask_ps,
-    _mm256_setzero_si256,
-};
-use core::mem::transmute;
+use crate::divisor::Divisor;
+
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 
 struct CongruentialSolver {
     rows: usize,
     columns: usize,
-    divisor: u32,
-    coefficients: *mut u32,
+    divisor: Divisor,
+    coefficients: *mut u16,
 }
 
 enum SolveResult {
-    Determinate { residues: Vec<u32> },
-    Incompatible { coefficients: Vec<u32> },
+    Determinate { residues: Vec<u16> },
+    Incompatible { coefficients: Vec<u16> },
     Compatible,
 }
 
 impl CongruentialSolver {
-    pub fn new(rows: usize, columns: usize, divisor: u32) -> CongruentialSolver {
-        let _size = rows * pad_columns(columns);
-        let coefficients = {
-            let size = rows * pad_columns(columns);
-            unsafe {
-                let layout = Layout::from_size_align_unchecked(4 * size, 32);
-                alloc_zeroed(layout) as *mut u32
-            }
-        };
+    pub fn new(rows: usize, columns: usize, modulus: u16) -> CongruentialSolver {
+        let coefficients = unsafe { alloc_zeroed(Self::layout(rows, columns)) as *mut u16 };
+
+        let divisor = Divisor::new(modulus);
 
         CongruentialSolver {
             rows,
@@ -37,41 +29,116 @@ impl CongruentialSolver {
         }
     }
 
+    pub(crate) fn from_vec(coefficients: Vec<Vec<u16>>, modulus: u16) -> Self {
+        assert!(!coefficients.is_empty());
+        assert!(!coefficients[0].is_empty());
+
+        let rows = coefficients.len();
+        let columns = coefficients[0].len() - 1;
+
+        for row in coefficients.iter().skip(1) {
+            assert!(row.len() == columns + 1);
+        }
+
+        let mut solver = Self::new(rows, columns, modulus);
+
+        for (i, row) in coefficients.iter().enumerate() {
+            for (j, &value) in row.iter().enumerate() {
+                solver.set(i, j, value);
+            }
+        }
+
+        solver
+    }
+
+    pub fn get(&self, i: usize, j: usize) -> u16 {
+        assert!(i < self.rows);
+        assert!(j <= self.columns);
+        unsafe { *self.row(i).add(j) }
+    }
+
+    pub fn set(&mut self, i: usize, j: usize, value: u16) {
+        assert!(i < self.rows);
+        assert!(j <= self.columns);
+        unsafe {
+            *self.row_mut(i).add(j) = value;
+        }
+    }
+
     pub fn solve(self) -> SolveResult {
-        for _i in 0..self.rows {}
+        if self.rows < self.columns {
+            return SolveResult::Compatible;
+        }
+
+        for j in 0..self.columns {
+            let (_i, leading_coefficient) = match unsafe { self.find_non_zero_coefficient(j) } {
+                Some(pair) => pair,
+                None => return SolveResult::Compatible,
+            };
+
+            let _inverse =
+                modular_inverse(leading_coefficient as i32, self.divisor.divisor() as i32);
+
+            // Swap i, j and normalize
+            // Eliminate
+        }
+
+        // Check extra rows
+        // Back-substitute
 
         unimplemented!();
     }
 
-    unsafe fn row(&self, row: usize) -> *const u32 {
-        self.coefficients.add(row * pad_columns(self.columns))
+    fn width(columns: usize) -> usize {
+        #[cfg(target_feature = "avx2")]
+        {
+            pad8(columns + 1)
+        }
+
+        #[cfg(not(target_feature = "avx2"))]
+        {
+            columns + 1
+        }
     }
 
-    unsafe fn non_zero_coefficient(&self, row: usize, from: usize) -> Option<(usize, u32)> {
-        non_zero_element(self.row(row), from, self.columns)
+    fn layout(rows: usize, columns: usize) -> Layout {
+        let size = rows * Self::width(columns);
+        unsafe { Layout::from_size_align_unchecked(2 * size, 32) }
+    }
+
+    unsafe fn row(&self, i: usize) -> *const u16 {
+        debug_assert!(i < self.rows);
+        self.coefficients.add(i * Self::width(self.columns))
+    }
+
+    unsafe fn row_mut(&mut self, i: usize) -> *mut u16 {
+        debug_assert!(i < self.rows);
+        self.coefficients.add(i * Self::width(self.columns))
+    }
+
+    unsafe fn find_non_zero_coefficient(&self, column: usize) -> Option<(usize, u16)> {
+        debug_assert!(column < self.columns);
+        debug_assert!(self.columns <= self.rows);
+
+        for i in column..self.rows {
+            let value = *self.row(i).add(column);
+            if value != 0 {
+                return Some((i, value));
+            }
+        }
+
+        None
     }
 }
 
 impl Drop for CongruentialSolver {
     fn drop(&mut self) {
-        let size = self.rows * pad_columns(self.columns);
-
         unsafe {
-            let layout = Layout::from_size_align_unchecked(4 * size, 32);
-            dealloc(self.coefficients as *mut u8, layout);
+            dealloc(
+                self.coefficients as *mut u8,
+                Self::layout(self.rows, self.columns),
+            );
         }
-    }
-}
-
-fn pad_columns(columns: usize) -> usize {
-    #[cfg(target_feature = "avx2")]
-    {
-        pad8(columns)
-    }
-
-    #[cfg(not(target_feature = "avx2"))]
-    {
-        columns
     }
 }
 
@@ -80,7 +147,7 @@ fn pad8(value: usize) -> usize {
 }
 
 // Given relatively prime p and q, compute the modular inverse of q modulo p using the Extended Euclidean Algorithm
-fn modular_inverse(p: i64, q: i64) -> i64 {
+fn modular_inverse(p: i32, q: i32) -> i32 {
     let p0 = p;
     let q0 = q;
 
@@ -111,53 +178,44 @@ fn modular_inverse(p: i64, q: i64) -> i64 {
 
     debug_assert!(p == 1 && q == 0);
     debug_assert!(p0 * s0 + q0 * t0 == 1);
+    debug_assert!(-p0 < t0 && t0 < p0);
 
-    (t0 + p0) % p0
+    if t0 < 0 {
+        t0 + p0
+    } else {
+        t0
+    }
 }
 
-unsafe fn non_zero_element(data: *const u32, from: usize, len: usize) -> Option<(usize, u32)> {
-    debug_assert!(data.align_offset(32) == 0);
-
+unsafe fn modular_multiply_and_swap(
+    destination: *mut u16,
+    source: *mut u16,
+    _from: usize,
+    _len: usize,
+    _multiplier: u16,
+    _divisor: Divisor,
+) {
     #[cfg(target_feature = "avx2")]
     {
-        for i in from..pad8(from).min(len) {
-            let value = *data.add(i);
-            if value != 0 {
-                return Some((i, value));
-            }
-        }
-
-        for i in (pad8(from)..len).step_by(8) {
-            let values = _mm256_load_si256(transmute(data.add(i)));
-            let zeros = _mm256_cmpeq_epi32(values, _mm256_setzero_si256());
-            let non_zero_mask = _mm256_movemask_ps(_mm256_cvtepi32_ps(zeros)) ^ 0b11111111;
-
-            if non_zero_mask != 0 {
-                let j = non_zero_mask.trailing_zeros() as usize;
-                let coefficient = *data.add(i + j);
-                return Some((i + j, coefficient));
-            }
-        }
+        debug_assert!(destination.align_offset(32) == 0);
+        debug_assert!(source.align_offset(32) == 0);
+        unimplemented!();
     }
 
     #[cfg(not(target_feature = "avx2"))]
     {
         for i in from..len {
-            let value = *data.add(i);
-            if value != 0 {
-                return Some((i, value));
-            }
+            let t = *destination.add(i);
+            let x = *source.add(i);
+            let y = x.widening_mul(multiplier);
+            *destination.add(i) = (source as u32)
         }
     }
-
-    None
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::congruential_solver::{modular_inverse, non_zero_element, pad8};
-    use core::slice;
-    use std::alloc::{alloc_zeroed, dealloc, Layout};
+    use crate::congruential_solver::{modular_inverse, pad8};
 
     #[test]
     fn test_pad8() {
@@ -174,44 +232,6 @@ mod tests {
                 let inverse = modular_inverse(p, i);
                 assert_eq!((i * inverse) % p, 1);
             }
-        }
-    }
-
-    #[test]
-    fn test_non_zero_element() {
-        let layout = unsafe { Layout::from_size_align_unchecked(4 * 10000, 32) };
-
-        let data: &mut [u32] =
-            unsafe { slice::from_raw_parts_mut(alloc_zeroed(layout) as *mut u32, 10000) };
-
-        for len in [1, 2, 3, 5, 7, 10, 13, 25, 100, 1000, 10000] {
-            assert_eq!(unsafe { non_zero_element(data.as_ptr(), 0, len) }, None);
-
-            for i in 0..len {
-                if i > 0 {
-                    data[i - 1] = 0;
-                }
-                data[i] = (i + 1) as u32;
-
-                assert_eq!(
-                    unsafe { non_zero_element(data.as_ptr(), 0, len) },
-                    Some((i, (i + 1) as u32))
-                );
-
-                assert_eq!(
-                    unsafe { non_zero_element(data.as_ptr(), i, len) },
-                    Some((i, (i + 1) as u32))
-                );
-
-                assert_eq!(unsafe { non_zero_element(data.as_ptr(), i + 1, len) }, None);
-                assert_eq!(unsafe { non_zero_element(data.as_ptr(), len, len) }, None);
-            }
-
-            data[len - 1] = 0
-        }
-
-        unsafe {
-            dealloc(data.as_mut_ptr() as *mut u8, layout);
         }
     }
 }

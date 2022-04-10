@@ -3,7 +3,7 @@ use core::arch::x86_64::{
     _mm256_srl_epi16, _mm256_sub_epi16, _mm_set1_epi64x,
 };
 
-struct Divisor {
+pub struct Divisor {
     divisor: u16,
     multiplier: u16,
     inner_shift: u16,
@@ -11,7 +11,7 @@ struct Divisor {
 }
 
 impl Divisor {
-    fn new(divisor: u16) -> Self {
+    pub fn new(divisor: u16) -> Self {
         debug_assert!(divisor != 0);
 
         let log2_divisor = (2 * (divisor as u32) - 1).log2() as u16;
@@ -36,17 +36,21 @@ impl Divisor {
         }
     }
 
-    fn divide(&self, numerator: u16) -> u16 {
+    pub fn divisor(&self) -> u16 {
+        self.divisor
+    }
+
+    pub fn divide(&self, numerator: u16) -> u16 {
         let t = numerator.widening_mul(self.multiplier).1;
         (t + ((numerator - t) >> self.inner_shift)) >> self.outer_shift
     }
 
-    fn modulo(&self, numerator: u16) -> u16 {
+    pub fn modulo(&self, numerator: u16) -> u16 {
         numerator - self.divide(numerator) * self.divisor
     }
 
     #[cfg(target_feature = "avx2")]
-    unsafe fn divide_m256i(&self, numerators: __m256i) -> __m256i {
+    pub unsafe fn divide_m256i(&self, numerators: __m256i) -> __m256i {
         let t = _mm256_mulhi_epu16(numerators, _mm256_set1_epi16(self.multiplier as i16));
 
         let inner = _mm256_srl_epi16(
@@ -61,7 +65,7 @@ impl Divisor {
     }
 
     #[cfg(target_feature = "avx2")]
-    unsafe fn modulo_m256i(&self, numerators: __m256i) -> __m256i {
+    pub unsafe fn modulo_m256i(&self, numerators: __m256i) -> __m256i {
         let quotients = self.divide_m256i(numerators);
         _mm256_sub_epi16(
             numerators,
@@ -70,9 +74,76 @@ impl Divisor {
     }
 }
 
+pub struct Divisor32x16 {
+    divisor: u16,
+    l: u16,
+    m_prime: u16,
+    d_norm: u16,
+}
+
+impl Divisor32x16 {
+    fn new(divisor: u16) -> Self {
+        let l = (1 + divisor.log2()) as u16;
+
+        let m_prime =
+            (((1u32 << 16) * ((1u32 << l) - (divisor as u32)) - 1) / (divisor as u32)) as u16;
+
+        let d_norm = divisor << (16 - l);
+
+        Self {
+            divisor,
+            l,
+            m_prime,
+            d_norm,
+        }
+    }
+
+    fn divide(&self, numerator: u32) -> (u16, u16) {
+        fn high(n: u32) -> u16 {
+            (n >> 16) as u16
+        }
+
+        fn low(n: u32) -> u16 {
+            n as u16
+        }
+
+        let n_2 = {
+            let n_2x = high(numerator) << (16 - self.l);
+            if self.l == 16 {
+                n_2x
+            } else {
+                n_2x + (low(numerator) >> self.l)
+            }
+        };
+
+        let n_10 = low(numerator) << (16 - self.l);
+
+        let minus_n_1 = ((n_10 as i16) >> 15) as u16;
+
+        let n_adj = n_10.wrapping_add(minus_n_1 & self.d_norm);
+
+        let q_1 = {
+            let q_1x = (self.m_prime as u32) * ((n_2.wrapping_sub(minus_n_1 as u16)) as u32)
+                + (n_adj as u32);
+            n_2 + high(q_1x)
+        };
+
+        let dr = (numerator
+            .wrapping_sub((q_1 as u32) * (self.divisor as u32))
+            .wrapping_sub(self.divisor as u32)) as i32;
+
+        debug_assert!(-(self.divisor as i32) <= dr && dr < (self.divisor as i32));
+
+        (
+            q_1.wrapping_add(1).wrapping_sub(1 & high(dr as u32)),
+            (dr as u16).wrapping_add(self.divisor & high(dr as u32)),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::divisor::Divisor;
+    use crate::divisor::{Divisor, Divisor32x16};
     use core::arch::x86_64::_mm256_loadu_si256;
     use core::iter;
     use core::mem::transmute;
@@ -130,6 +201,52 @@ mod tests {
                 let residues: [u16; 16] = unsafe { transmute(divisor.modulo_m256i(numerators)) };
                 assert_eq!(&quotients, quotients_vec.as_slice());
                 assert_eq!(&residues, residues_vec.as_slice());
+            }
+        }
+    }
+
+    #[test]
+    fn test_divide_modulo2() {
+        let mut rng = thread_rng();
+
+        let denominators = (1..5000)
+            .chain((5000..u16::MAX).step_by(17))
+            .chain((0..16).map(|i| 1 << i))
+            .chain(iter::once(u16::MAX))
+            .chain((0..100000).map(|_| rng.gen::<u16>()))
+            .collect::<Vec<_>>();
+
+        let numerators = {
+            let mut numerators = iter::once(0u32)
+                .chain(denominators.iter().map(|&i| i as u32))
+                .chain((16..32).map(|i| 1u32 << i))
+                .chain(iter::once(u32::MAX))
+                .chain((0..100000).map(|_| rng.gen::<u32>()))
+                .collect::<Vec<_>>();
+            numerators.sort_unstable();
+            numerators
+        };
+
+        for &denominator in &denominators {
+            if denominator == 0 {
+                continue;
+            }
+
+            let divisor = Divisor32x16::new(denominator);
+
+            for &numerator in &numerators {
+                let expected_quotient = numerator / (denominator as u32);
+
+                if expected_quotient > (u16::MAX as u32) {
+                    break;
+                }
+
+                let expected_quotient = expected_quotient as u16;
+                let expected_residue = (numerator % (denominator as u32)) as u16;
+
+                let (quotient, residue) = divisor.divide(numerator);
+                assert_eq!(quotient, expected_quotient);
+                assert_eq!(residue, expected_residue);
             }
         }
     }
