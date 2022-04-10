@@ -8,7 +8,7 @@ use std::alloc::{alloc_zeroed, dealloc, Layout};
 struct CongruentialSolver {
     rows: usize,
     columns: usize,
-    modulus: u32,
+    divisor: u32,
     coefficients: *mut u32,
 }
 
@@ -19,8 +19,8 @@ enum SolveResult {
 }
 
 impl CongruentialSolver {
-    pub fn new(rows: usize, columns: usize, modulus: u32) -> CongruentialSolver {
-        let size = rows * pad_columns(columns);
+    pub fn new(rows: usize, columns: usize, divisor: u32) -> CongruentialSolver {
+        let _size = rows * pad_columns(columns);
         let coefficients = {
             let size = rows * pad_columns(columns);
             unsafe {
@@ -32,13 +32,13 @@ impl CongruentialSolver {
         CongruentialSolver {
             rows,
             columns,
-            modulus,
+            divisor,
             coefficients,
         }
     }
 
     pub fn solve(self) -> SolveResult {
-        for i in 0..self.rows {}
+        for _i in 0..self.rows {}
 
         unimplemented!();
     }
@@ -120,7 +120,7 @@ unsafe fn non_zero_element(data: *const u32, from: usize, len: usize) -> Option<
 
     #[cfg(target_feature = "avx2")]
     {
-        for i in from..pad8(from) {
+        for i in from..pad8(from).min(len) {
             let value = *data.add(i);
             if value != 0 {
                 return Some((i, value));
@@ -160,6 +160,24 @@ mod tests {
     use std::alloc::{alloc_zeroed, dealloc, Layout};
 
     #[test]
+    fn test_pad8() {
+        for columns in 0..1000000 {
+            let padded = pad8(columns);
+            assert!(padded >= columns && padded - columns < 8 && padded % 8 == 0);
+        }
+    }
+
+    #[test]
+    fn test_modular_inverse() {
+        for &p in &[2, 3, 5, 7, 11, 13, 17, 19, 9001] {
+            for i in 1..p {
+                let inverse = modular_inverse(p, i);
+                assert_eq!((i * inverse) % p, 1);
+            }
+        }
+    }
+
+    #[test]
     fn test_non_zero_element() {
         let layout = unsafe { Layout::from_size_align_unchecked(4 * 10000, 32) };
 
@@ -194,24 +212,6 @@ mod tests {
 
         unsafe {
             dealloc(data.as_mut_ptr() as *mut u8, layout);
-        }
-    }
-
-    #[test]
-    fn test_pad8() {
-        for columns in 0..100000 {
-            let padded = pad8(columns);
-            assert!(padded >= columns && padded - columns < 8 && padded % 8 == 0);
-        }
-    }
-
-    #[test]
-    fn test_modular_inverse() {
-        for &p in &[2, 3, 5, 7, 11, 13, 17, 19, 9001] {
-            for i in 1..p {
-                let inverse = modular_inverse(p, i);
-                assert_eq!((i * inverse) % p, 1);
-            }
         }
     }
 }
