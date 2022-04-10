@@ -1,11 +1,11 @@
-use crate::divisor::Divisor;
+use crate::divisor::Divisor32x16;
 
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 
 struct CongruentialSolver {
     rows: usize,
     columns: usize,
-    divisor: Divisor,
+    divisor: Divisor32x16,
     coefficients: *mut u16,
 }
 
@@ -19,7 +19,7 @@ impl CongruentialSolver {
     pub fn new(rows: usize, columns: usize, modulus: u16) -> CongruentialSolver {
         let coefficients = unsafe { alloc_zeroed(Self::layout(rows, columns)) as *mut u16 };
 
-        let divisor = Divisor::new(modulus);
+        let divisor = Divisor32x16::new(modulus);
 
         CongruentialSolver {
             rows,
@@ -180,25 +180,32 @@ fn modular_inverse(p: i32, q: i32) -> i32 {
     debug_assert!(p0 * s0 + q0 * t0 == 1);
     debug_assert!(-p0 < t0 && t0 < p0);
 
-    if t0 < 0 {
-        t0 + p0
-    } else {
-        t0
-    }
+    t0 + ((t0 >> 31) & p0)
 }
 
 unsafe fn modular_multiply_and_swap(
-    destination: *mut u16,
     source: *mut u16,
-    _from: usize,
-    _len: usize,
-    _multiplier: u16,
-    _divisor: Divisor,
+    destination: *mut u16,
+    from: usize,
+    len: usize,
+    multiplier: u16,
+    divisor: &Divisor32x16,
 ) {
     #[cfg(target_feature = "avx2")]
     {
-        debug_assert!(destination.align_offset(32) == 0);
         debug_assert!(source.align_offset(32) == 0);
+        debug_assert!(destination.align_offset(32) == 0);
+
+        for i in from..pad8(from).min(len) {
+            let t = *destination.add(i);
+            let x = *source.add(i);
+            let y = (x as u32) * (multiplier as u32);
+            destination
+                .add(i)
+                .write((y % (divisor.divisor() as u32)) as u16);
+            source.add(i).write(t);
+        }
+
         unimplemented!();
     }
 
@@ -207,15 +214,22 @@ unsafe fn modular_multiply_and_swap(
         for i in from..len {
             let t = *destination.add(i);
             let x = *source.add(i);
-            let y = x.widening_mul(multiplier);
-            *destination.add(i) = (source as u32)
+            let y = (x as u32) * (multiplier as u32);
+            destination
+                .add(i)
+                .write((y % (divisor.divisor() as u32)) as u16);
+            source.add(i).write(t);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::congruential_solver::{modular_inverse, pad8};
+    use crate::congruential_solver::{modular_inverse, modular_multiply_and_swap, pad8};
+    use crate::divisor::Divisor32x16;
+    use core::{ptr, slice};
+    use rand::{thread_rng, Rng};
+    use std::alloc::{alloc_zeroed, dealloc, Layout};
 
     #[test]
     fn test_pad8() {
@@ -232,6 +246,67 @@ mod tests {
                 let inverse = modular_inverse(p, i);
                 assert_eq!((i * inverse) % p, 1);
             }
+        }
+    }
+
+    #[test]
+    fn test_modular_multiply_and_swap() {
+        let mut rng = thread_rng();
+
+        let divisors = [
+            2, 3, 5, 7, 11, 13, 17, 19, 9001, 31907, 31957, 31963, 31973, 31981, 31991, 32003,
+            32009, 32027, 32029, 32051, 32057, 32059, 32063, 32069, 32077, 64901, 64919, 64921,
+            64927, 64937, 64951, 64969, 64997,
+        ];
+
+        let max_len = 10000;
+
+        let (layout, destination, source) = unsafe {
+            let layout = Layout::from_size_align_unchecked(2 * max_len, 32);
+            (
+                layout,
+                alloc_zeroed(layout) as *mut u16,
+                alloc_zeroed(layout) as *mut u16,
+            )
+        };
+
+        for divisor in divisors {
+            let divisor = Divisor32x16::new(divisor);
+
+            for _ in 0..10 {
+                let len = rng.gen_range(0..max_len + 1);
+                let multiplier = rng.gen_range(0..divisor.divisor());
+
+                let destination_data = (0..len)
+                    .map(|_| rng.gen_range(0..divisor.divisor()))
+                    .collect::<Vec<_>>();
+
+                let source_data = (0..len)
+                    .map(|_| rng.gen_range(0..divisor.divisor()))
+                    .collect::<Vec<_>>();
+
+                let expected_data = source_data
+                    .iter()
+                    .map(|&value| {
+                        (((value as u32) * (multiplier as u32)) % (divisor.divisor() as u32)) as u16
+                    })
+                    .collect::<Vec<_>>();
+
+                unsafe {
+                    ptr::copy(source_data.as_ptr(), source, len);
+                    ptr::copy(destination_data.as_ptr(), destination, len);
+
+                    modular_multiply_and_swap(source, destination, 0, len, multiplier, &divisor);
+
+                    assert_eq!(slice::from_raw_parts(destination, len), &expected_data);
+                    assert_eq!(slice::from_raw_parts(source, len), &destination_data);
+                }
+            }
+        }
+
+        unsafe {
+            dealloc(source as *mut u8, layout);
+            dealloc(destination as *mut u8, layout);
         }
     }
 }

@@ -1,3 +1,4 @@
+#[cfg(target_feature = "avx2")]
 use core::arch::x86_64::{
     __m256i, _mm256_add_epi16, _mm256_mulhi_epu16, _mm256_mullo_epi16, _mm256_set1_epi16,
     _mm256_srl_epi16, _mm256_sub_epi16, _mm_set1_epi64x,
@@ -82,7 +83,7 @@ pub struct Divisor32x16 {
 }
 
 impl Divisor32x16 {
-    fn new(divisor: u16) -> Self {
+    pub fn new(divisor: u16) -> Self {
         let l = (1 + divisor.log2()) as u16;
 
         let m_prime =
@@ -98,7 +99,11 @@ impl Divisor32x16 {
         }
     }
 
-    fn divide(&self, numerator: u32) -> (u16, u16) {
+    pub fn divisor(&self) -> u16 {
+        self.divisor
+    }
+
+    pub fn divide(&self, numerator: u32) -> (u16, u16) {
         fn high(n: u32) -> u16 {
             (n >> 16) as u16
         }
@@ -146,21 +151,35 @@ mod tests {
     use crate::divisor::{Divisor, Divisor32x16};
     use core::arch::x86_64::_mm256_loadu_si256;
     use core::iter;
-    use core::mem::transmute;
     use rand::{thread_rng, Rng};
+
+    #[cfg(target_feature = "avx2")]
+    use core::mem::transmute;
+
+    fn cases() -> Vec<u16> {
+        let mut rng = thread_rng();
+        let mut cases = (1..1000)
+            .chain((1000..u16::MAX).step_by(100))
+            .chain((0..16).map(|i| 1 << i))
+            .chain(iter::once(u16::MAX))
+            .chain((0..1000).map(|_| rng.gen::<u16>()))
+            .collect::<Vec<_>>();
+        cases.sort_unstable();
+        cases
+    }
 
     #[test]
     fn test_divide_modulo() {
-        let cases = (1..5000)
-            .chain((5000..u16::MAX).step_by(17))
-            .chain((0..16).map(|i| 1 << i))
-            .chain(iter::once(u16::MAX))
-            .collect::<Vec<u16>>();
+        let cases = cases();
 
         for &denominator in &cases {
+            if denominator == 0 {
+                continue;
+            }
+
             let divisor = Divisor::new(denominator);
 
-            for &numerator in iter::once(&0u16).chain(cases.iter()) {
+            for &numerator in &cases {
                 assert_eq!(divisor.divide(numerator), numerator / denominator);
                 assert_eq!(divisor.modulo(numerator), numerator % denominator);
             }
@@ -170,15 +189,14 @@ mod tests {
     #[test]
     #[cfg(target_feature = "avx2")]
     fn test_divide_modulo_m256() {
-        let cases = (0..5000)
-            .chain((5000..u16::MAX).step_by(17))
-            .chain((0..16).map(|i| 1 << i))
-            .chain(iter::once(u16::MAX))
-            .collect::<Vec<u16>>();
-
         let mut rng = thread_rng();
+        let cases = cases();
 
-        for &denominator in cases.iter().skip(1) {
+        for &denominator in &cases {
+            if denominator == 0 {
+                continue;
+            }
+
             let divisor = Divisor::new(denominator);
 
             for _ in 0..100 {
@@ -209,19 +227,15 @@ mod tests {
     fn test_divide_modulo2() {
         let mut rng = thread_rng();
 
-        let denominators = (1..5000)
-            .chain((5000..u16::MAX).step_by(17))
-            .chain((0..16).map(|i| 1 << i))
-            .chain(iter::once(u16::MAX))
-            .chain((0..100000).map(|_| rng.gen::<u16>()))
-            .collect::<Vec<_>>();
+        let denominators = cases();
 
         let numerators = {
-            let mut numerators = iter::once(0u32)
-                .chain(denominators.iter().map(|&i| i as u32))
+            let mut numerators = denominators
+                .iter()
+                .map(|&i| i as u32)
                 .chain((16..32).map(|i| 1u32 << i))
                 .chain(iter::once(u32::MAX))
-                .chain((0..100000).map(|_| rng.gen::<u32>()))
+                .chain((0..1000).map(|_| rng.gen::<u32>()))
                 .collect::<Vec<_>>();
             numerators.sort_unstable();
             numerators
