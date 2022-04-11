@@ -1,5 +1,10 @@
 use crate::divisor::Divisor32x16;
 
+use core::arch::x86_64::{
+    __m256i, _mm256_castsi256_si128, _mm256_cvtepu16_epi32, _mm256_load_si256, _mm256_mullo_epi32,
+    _mm256_packus_epi32, _mm256_permute2x128_si256, _mm256_permute4x64_epi64, _mm256_set1_epi32,
+    _mm256_store_si256,
+};
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 
 struct CongruentialSolver {
@@ -92,7 +97,7 @@ impl CongruentialSolver {
     fn width(columns: usize) -> usize {
         #[cfg(target_feature = "avx2")]
         {
-            pad8(columns + 1)
+            pad16(columns + 1)
         }
 
         #[cfg(not(target_feature = "avx2"))]
@@ -142,8 +147,8 @@ impl Drop for CongruentialSolver {
     }
 }
 
-fn pad8(value: usize) -> usize {
-    value + ((8 - (value % 8)) % 8)
+fn pad16(value: usize) -> usize {
+    value + ((16 - (value % 16)) % 16)
 }
 
 // Given relatively prime p and q, compute the modular inverse of q modulo p using the Extended Euclidean Algorithm
@@ -196,17 +201,38 @@ unsafe fn modular_multiply_and_swap(
         debug_assert!(source.align_offset(32) == 0);
         debug_assert!(destination.align_offset(32) == 0);
 
-        for i in from..pad8(from).min(len) {
+        for i in from..pad16(from).min(len) {
             let t = *destination.add(i);
             let x = *source.add(i);
-            let y = (x as u32) * (multiplier as u32);
-            destination
-                .add(i)
-                .write((y % (divisor.divisor() as u32)) as u16);
             source.add(i).write(t);
+            let y = (x as u32) * (multiplier as u32);
+            destination.add(i).write(divisor.modulo(y));
         }
 
-        unimplemented!();
+        for i in (pad16(from)..len).step_by(16) {
+            let t = _mm256_load_si256(destination.add(i) as *const __m256i);
+            let x = _mm256_load_si256(source.add(i) as *const __m256i);
+            _mm256_store_si256(source.add(i) as *mut __m256i, t);
+
+            let x_low = _mm256_castsi256_si128(x);
+            let y_low = _mm256_mullo_epi32(
+                _mm256_cvtepu16_epi32(x_low),
+                _mm256_set1_epi32(multiplier as i32),
+            );
+            let y_mod_low = divisor.modulo_m256i(y_low);
+
+            let x_high = _mm256_castsi256_si128(_mm256_permute2x128_si256(x, x, 1));
+            let y_high = _mm256_mullo_epi32(
+                _mm256_cvtepu16_epi32(x_high),
+                _mm256_set1_epi32(multiplier as i32),
+            );
+            let y_mod_high = divisor.modulo_m256i(y_high);
+
+            let y_mod_permuted = _mm256_packus_epi32(y_mod_low, y_mod_high);
+            let y_mod = _mm256_permute4x64_epi64(y_mod_permuted, 0xd8);
+
+            _mm256_store_si256(destination.add(i) as *mut __m256i, y_mod);
+        }
     }
 
     #[cfg(not(target_feature = "avx2"))]
@@ -214,28 +240,26 @@ unsafe fn modular_multiply_and_swap(
         for i in from..len {
             let t = *destination.add(i);
             let x = *source.add(i);
-            let y = (x as u32) * (multiplier as u32);
-            destination
-                .add(i)
-                .write((y % (divisor.divisor() as u32)) as u16);
             source.add(i).write(t);
+            let y = (x as u32) * (multiplier as u32);
+            destination.add(i).write(divisor.modulo(y));
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::congruential_solver::{modular_inverse, modular_multiply_and_swap, pad8};
+    use crate::congruential_solver::{modular_inverse, modular_multiply_and_swap, pad16};
     use crate::divisor::Divisor32x16;
     use core::{ptr, slice};
     use rand::{thread_rng, Rng};
     use std::alloc::{alloc_zeroed, dealloc, Layout};
 
     #[test]
-    fn test_pad8() {
+    fn test_pad16() {
         for columns in 0..1000000 {
-            let padded = pad8(columns);
-            assert!(padded >= columns && padded - columns < 8 && padded % 8 == 0);
+            let padded = pad16(columns);
+            assert!(padded >= columns && padded - columns < 16 && padded % 16 == 0);
         }
     }
 
@@ -262,7 +286,7 @@ mod tests {
         let max_len = 10000;
 
         let (layout, destination, source) = unsafe {
-            let layout = Layout::from_size_align_unchecked(2 * max_len, 32);
+            let layout = Layout::from_size_align_unchecked(2 * pad16(max_len), 32);
             (
                 layout,
                 alloc_zeroed(layout) as *mut u16,
